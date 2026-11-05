@@ -7,6 +7,8 @@ Built with Swift and Metal; denoising and upscaling use MetalFX. Tested on macOS
 
 ![Newspaper close-up](preview_closeup.png)
 
+A Rust and Vulkan port for Windows, not yet run on a GPU, is in [rust/](rust/README.md).
+
 ## Build and run
 
     ./build.sh

@@ -1,0 +1,53 @@
+#version 460
+// Puts the final colour together, then applies temporal antialiasing: the camera jitters by a
+// fraction of a pixel each frame, and blending frames smooths edges and fine print.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+vec3 pixelColor(ivec2 p) {
+    vec4 albedo = imageLoad(images[ALBEDO], p);
+    // Glass is already clean, and filtering is what would make it look frosted.
+    if (push.denoise == 0 || albedo.a > 0.5) return imageLoad(images[COLOR], p).rgb;
+    return imageLoad(images[FILTER_A], p).rgb * albedo.rgb;
+}
+
+void main() {
+    PIXEL_GUARD
+
+    vec3 current = pixelColor(pixel);
+    if (push.denoise == 0) {
+        imageStore(images[TAA_NEW], pixel, vec4(current, 0.0));
+        return;
+    }
+
+    // Neighbourhood limits: history outside this range no longer belongs to this pixel.
+    vec3 low = current;
+    vec3 high = current;
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            ivec2 q = clamp(pixel + ivec2(x, y), ivec2(0), ivec2(u.size) - 1);
+            vec3 c = pixelColor(q);
+            low = min(low, c);
+            high = max(high, c);
+        }
+    }
+
+    vec2 motion = imageLoad(images[MOTION], pixel).xy;
+    vec2 previous = vec2(pixel) + 0.5 + motion - 0.5;
+    ivec2 base = ivec2(floor(previous));
+    vec2 f = previous - vec2(base);
+    vec3 result = current;
+    if (all(greaterThanEqual(base, ivec2(0))) && all(lessThan(base + 1, ivec2(u.size)))) {
+        vec4 a = imageLoad(images[TAA_OLD], base);
+        vec4 b = imageLoad(images[TAA_OLD], base + ivec2(1, 0));
+        vec4 c = imageLoad(images[TAA_OLD], base + ivec2(0, 1));
+        vec4 d = imageLoad(images[TAA_OLD], base + ivec2(1, 1));
+        vec4 old = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+        if (old.a > 0.99) {
+            bool glass = imageLoad(images[ALBEDO], pixel).a > 0.5;
+            // What glass shows changes faster than its surface moves, so it trusts history less.
+            result = mix(clamp(old.rgb, low, high), current, glass ? 0.3 : 0.1);
+        }
+    }
+    imageStore(images[TAA_NEW], pixel, vec4(result, 1.0));
+}

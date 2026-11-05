@@ -1,0 +1,28 @@
+[package]
+name = "glass-marbles"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time path traced glass marbles, using Vulkan ray queries"
+publish = false
+
+[lib]
+name = "glass_marbles"
+path = "src/lib.rs"
+
+[[bin]]
+name = "glass-marbles"
+path = "src/main.rs"
+
+[dependencies]
+# "loaded" finds the Vulkan driver at run time, so building needs no Vulkan SDK.
+ash = { version = "0.38", default-features = false, features = ["loaded", "std", "debug"] }
+ash-window = "0.13"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.29"
+png = "0.17"
+raw-window-handle = "0.6"
+winit = "0.30"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

@@ -1,0 +1,46 @@
+#version 460
+// Second denoising step: an edge-aware blur with a growing stride (a-trous wavelet).
+// Pixels with little history are noisy, so they get blurred harder than settled ones.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+const float KERNEL[3] = float[3](0.375, 0.25, 0.0625);
+
+float luminance(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    PIXEL_GUARD
+
+    vec4 center = imageLoad(images[push.source], pixel);
+    vec4 centerAlbedo = imageLoad(images[ALBEDO], pixel);
+    if (centerAlbedo.a > 0.5) {
+        imageStore(images[push.target], pixel, center);
+        return;
+    }
+    vec4 centerNormalDepth = imageLoad(images[NORMAL_DEPTH], pixel);
+    float centerLuminance = luminance(center.rgb);
+    // From very tolerant on a new pixel to strict once 32 frames have been averaged.
+    float tolerance = mix(4.0, 0.35, clamp(center.a / 16.0, 0.0, 1.0)) * (centerLuminance + 0.05);
+
+    vec3 sum = vec3(0.0);
+    float weightSum = 0.0;
+    for (int y = -2; y <= 2; y++) {
+        for (int x = -2; x <= 2; x++) {
+            ivec2 q = pixel + ivec2(x, y) * push.stepSize;
+            if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ivec2(u.size)))) continue;
+            if (imageLoad(images[ALBEDO], q).a > 0.5) continue;
+
+            vec4 sampleColor = imageLoad(images[push.source], q);
+            vec4 normalDepth = imageLoad(images[NORMAL_DEPTH], q);
+            float normalWeight = pow(max(dot(normalDepth.xyz, centerNormalDepth.xyz), 0.0), 32.0);
+            float depthWeight = exp(-abs(normalDepth.w - centerNormalDepth.w) / (0.02 * max(centerNormalDepth.w, 0.1)));
+            float lightWeight = exp(-abs(luminance(sampleColor.rgb) - centerLuminance) / tolerance);
+            float weight = KERNEL[abs(x)] * KERNEL[abs(y)] * normalWeight * depthWeight * lightWeight;
+            sum += sampleColor.rgb * weight;
+            weightSum += weight;
+        }
+    }
+    imageStore(images[push.target], pixel, vec4(weightSum > 1e-5 ? sum / weightSum : center.rgb, center.a));
+}

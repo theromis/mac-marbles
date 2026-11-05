@@ -1,0 +1,561 @@
+#version 460
+// Real-time path tracer for glass marbles on a wooden track.
+// Geometry: triangles (wood, paper) and analytic spheres (glass) in a hardware BVH.
+// Output: noisy radiance plus the guide images the denoiser needs. Glass is free of noise.
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(set = 0, binding = 1) uniform accelerationStructureEXT scene;
+
+struct Vertex {
+    vec4 position;  // w = material id
+    vec4 normal;
+};
+layout(set = 0, binding = 2, std430) readonly buffer Vertices { Vertex vertices[]; };
+
+struct Sphere {
+    vec4 centerRadius;
+    vec4 prevCenter;
+    vec4 absorption;  // xyz = absorption per unit length, w = index of refraction
+};
+layout(set = 0, binding = 3, std430) readonly buffer Spheres { Sphere spheres[]; };
+
+layout(set = 0, binding = 4) uniform sampler2D paperTexture;
+
+const uint MATERIAL_FLOOR = 0;
+const uint MATERIAL_DISH = 1;
+const uint MATERIAL_TRACK = 2;
+const uint MATERIAL_DARK = 4;
+const uint MATERIAL_PAPER = 5;
+
+const float EPSILON = 6e-4;
+const float PI = 3.14159265;
+
+#define saturate(x) clamp(x, 0.0, 1.0)
+
+// ------------------------------------------------------------------- ray queries
+
+const int HIT_NONE = 0;
+const int HIT_TRIANGLE = 1;
+const int HIT_SPHERE = 2;
+
+struct Hit {
+    int kind;
+    float distance;
+    int primitive;
+    vec2 barycentrics;
+};
+
+// Near root, or the far root when the ray starts inside the sphere. Negative means no hit.
+float sphereRoot(int index, vec3 origin, vec3 direction, float minDistance, float maxDistance) {
+    vec3 oc = origin - spheres[index].centerRadius.xyz;
+    float r = spheres[index].centerRadius.w;
+    float b = dot(oc, direction);
+    float h = b * b - (dot(oc, oc) - r * r);
+    if (h < 0.0) return -1.0;
+    h = sqrt(h);
+    float t = -b - h;
+    if (t < minDistance) t = -b + h;
+    if (t < minDistance || t > maxDistance) return -1.0;
+    return t;
+}
+
+// Ray queries do not run intersection shaders: the hardware reports each candidate box here,
+// and an accepted sphere has to be confirmed by hand. Triangles are opaque and commit themselves.
+Hit traceRay(vec3 origin, vec3 direction, float minDistance, float maxDistance) {
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsNoneEXT, 0xFF, origin, minDistance, direction, maxDistance);
+    while (rayQueryProceedEXT(query)) {
+        if (rayQueryGetIntersectionTypeEXT(query, false) == gl_RayQueryCandidateIntersectionAABBEXT) {
+            int index = rayQueryGetIntersectionPrimitiveIndexEXT(query, false);
+            bool committed = rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+            float limit = committed ? rayQueryGetIntersectionTEXT(query, true) : maxDistance;
+            float t = sphereRoot(index, origin, direction, minDistance, limit);
+            if (t >= 0.0) rayQueryGenerateIntersectionEXT(query, t);
+        }
+    }
+    Hit hit;
+    hit.kind = HIT_NONE;
+    hit.distance = 1e6;
+    hit.primitive = 0;
+    hit.barycentrics = vec2(0.0);
+    uint type = rayQueryGetIntersectionTypeEXT(query, true);
+    if (type == gl_RayQueryCommittedIntersectionNoneEXT) return hit;
+    hit.distance = rayQueryGetIntersectionTEXT(query, true);
+    hit.primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+    if (type == gl_RayQueryCommittedIntersectionTriangleEXT) {
+        hit.kind = HIT_TRIANGLE;
+        hit.barycentrics = rayQueryGetIntersectionBarycentricsEXT(query, true);
+    } else {
+        hit.kind = HIT_SPHERE;
+    }
+    return hit;
+}
+
+// ---------------------------------------------------------------------- random
+
+uint rngState;
+
+float rnd() {
+    rngState = rngState * 747796405u + 2891336453u;
+    uint w = ((rngState >> ((rngState >> 28u) + 4u)) ^ rngState) * 277803737u;
+    return float((w >> 22u) ^ w) * (1.0 / 4294967296.0);
+}
+
+float hash31(vec3 p) {
+    p = fract(p * 0.1031);
+    p += dot(p, p.zyx + 31.32);
+    return fract((p.x + p.y) * p.z);
+}
+
+float valueNoise(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = mix(mix(hash31(i), hash31(i + vec3(1, 0, 0)), f.x),
+                  mix(hash31(i + vec3(0, 1, 0)), hash31(i + vec3(1, 1, 0)), f.x), f.y);
+    float b = mix(mix(hash31(i + vec3(0, 0, 1)), hash31(i + vec3(1, 0, 1)), f.x),
+                  mix(hash31(i + vec3(0, 1, 1)), hash31(i + vec3(1, 1, 1)), f.x), f.y);
+    return mix(a, b, f.z);
+}
+
+// -------------------------------------------------------------------- materials
+
+struct Surface {
+    vec3 albedo;
+    float roughness;
+};
+
+// Procedural wood: stretched growth rings disturbed by low-frequency noise.
+Surface woodSurface(uint material, vec3 p, bool detailed) {
+    Surface s;
+    if (material == MATERIAL_DARK) {
+        s.albedo = vec3(0.012, 0.009, 0.007);
+        s.roughness = 0.8;
+        return s;
+    }
+    vec3 q = p;
+    vec3 light, dark;
+    float scale = 5.0;
+    s.roughness = 0.38;
+    if (material == MATERIAL_FLOOR) {
+        light = vec3(0.085, 0.046, 0.026);
+        dark = vec3(0.040, 0.021, 0.012);
+        // Planks along x.
+        float plank = floor(q.z / 1.4);
+        q.x += plank * 3.7;
+        q.z += plank * 11.0;
+        s.roughness = 0.5;
+    } else if (material == MATERIAL_DISH) {
+        light = vec3(0.27, 0.15, 0.075);
+        dark = vec3(0.17, 0.085, 0.04);
+        scale = 7.0;
+    } else if (material == MATERIAL_TRACK) {
+        light = vec3(0.60, 0.41, 0.23);
+        dark = vec3(0.27, 0.15, 0.07);
+        scale = 15.0;
+        s.roughness = 0.42;
+    } else {
+        light = vec3(0.42, 0.23, 0.11);
+        dark = vec3(0.21, 0.10, 0.045);
+        scale = 18.0;
+        q = q.yxz;
+    }
+    // Grain is invisible after a diffuse bounce, so indirect hits skip the noise evaluation.
+    if (!detailed) {
+        s.albedo = (light + dark) * 0.5;
+        return s;
+    }
+    vec3 stretched = vec3(q.x * 0.16, q.y, q.z) * scale;
+    float warp = valueNoise(stretched * 0.55);
+    float rings = fract(length(stretched.yz) * 0.55 + warp * 1.1);
+    rings = smoothstep(0.0, 0.75, rings) * (1.0 - smoothstep(0.75, 1.0, rings));
+    float grain = valueNoise(stretched * vec3(1.0, 11.0, 11.0));
+    s.albedo = mix(dark, light, saturate(rings * 0.75 + grain * 0.35));
+    return s;
+}
+
+float schlick(float cosine, float f0) {
+    return f0 + (1.0 - f0) * pow(saturate(1.0 - cosine), 5.0);
+}
+
+float dielectricFresnel(float cosI, float eta) {
+    float sin2T = eta * eta * (1.0 - cosI * cosI);
+    if (sin2T >= 1.0) return 1.0;
+    float cosT = sqrt(1.0 - sin2T);
+    float rs = (eta * cosI - cosT) / (eta * cosI + cosT);
+    float rp = (cosI - eta * cosT) / (cosI + eta * cosT);
+    return 0.5 * (rs * rs + rp * rp);
+}
+
+vec3 orthogonal(vec3 n) {
+    return abs(n.x) > 0.5 ? normalize(cross(n, vec3(0, 1, 0))) : normalize(cross(n, vec3(1, 0, 0)));
+}
+
+vec3 sampleCosine(vec3 n) {
+    float a = rnd() * 2.0 * PI;
+    float v = rnd();
+    float r = sqrt(v);
+    vec3 t = orthogonal(n);
+    vec3 b = cross(n, t);
+    return normalize(t * (r * cos(a)) + b * (r * sin(a)) + n * sqrt(max(0.0, 1.0 - v)));
+}
+
+// GGX half-vector sample, used for the glossy lobe of the varnished wood.
+vec3 sampleGgxReflection(vec3 n, vec3 v, float roughness) {
+    float a = roughness * roughness;
+    float r = rnd();
+    float phi = rnd() * 2.0 * PI;
+    float cosT = sqrt((1.0 - r) / (1.0 + (a * a - 1.0) * r));
+    float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+    vec3 t = orthogonal(n);
+    vec3 b = cross(n, t);
+    vec3 h = normalize(t * (sinT * cos(phi)) + b * (sinT * sin(phi)) + n * cosT);
+    return reflect(-v, h);
+}
+
+vec3 surfaceBrdf(Surface s, vec3 n, vec3 v, vec3 l) {
+    vec3 h = normalize(v + l);
+    float nl = saturate(dot(n, l));
+    float nv = max(dot(n, v), 1e-3);
+    float nh = saturate(dot(n, h));
+    float vh = saturate(dot(v, h));
+    float a = s.roughness * s.roughness;
+    float a2 = a * a;
+    float denom = nh * nh * (a2 - 1.0) + 1.0;
+    float d = a2 / max(PI * denom * denom, 1e-5);
+    float k = a * 0.5;
+    float vis = 1.0 / max(4.0 * (nl * (1.0 - k) + k) * (nv * (1.0 - k) + k), 1e-4);
+    float f = schlick(vh, 0.04);
+    return s.albedo * (1.0 - f) / PI + vec3(min(d * vis * f, 8.0));
+}
+
+// ------------------------------------------------------------------------ lights
+
+struct RectLight {
+    vec3 center;
+    vec3 u;  // half-extent vectors
+    vec3 v;
+    vec3 normal;
+    vec3 emission;
+};
+
+RectLight rectLight(vec3 center, vec3 target, float halfU, float halfV, vec3 emission) {
+    RectLight l;
+    l.center = center;
+    l.normal = normalize(target - center);
+    vec3 side = normalize(cross(l.normal, vec3(0, 1, 0)));
+    l.u = side * halfU;
+    l.v = cross(side, l.normal) * halfV;
+    l.emission = emission;
+    return l;
+}
+
+RectLight lightAt(uint index) {
+    if (index == 0) {
+        return rectLight(vec3(3.8, 7.5, 3.0), vec3(0, 0.8, 0), 1.6, 1.6, vec3(1.0, 0.78, 0.52) * 15.0);
+    }
+    return rectLight(vec3(-6.5, 3.6, -2.4), vec3(0, 1.0, 0), 0.9, 1.8, vec3(0.62, 0.74, 1.0) * 7.0);
+}
+
+vec3 hitLights(vec3 origin, vec3 dir, float maxT) {
+    for (uint i = 0; i < 2; i++) {
+        RectLight l = lightAt(i);
+        float denom = dot(dir, l.normal);
+        if (denom > -1e-4) continue;
+        float t = dot(l.center - origin, l.normal) / denom;
+        if (t <= 0.0 || t >= maxT) continue;
+        vec3 d = origin + dir * t - l.center;
+        float a = dot(d, l.u) / dot(l.u, l.u);
+        float b = dot(d, l.v) / dot(l.v, l.v);
+        // Round with a soft edge: a hard rectangle looks like a pixelated square in a small marble.
+        float falloff = 1.0 - smoothstep(0.55, 1.0, a * a + b * b);
+        if (falloff > 0.0) return l.emission * falloff;
+    }
+    return vec3(0);
+}
+
+// A dim warm room, so glass has something to refract and reflect in every direction.
+vec3 environment(vec3 d) {
+    float up = d.y * 0.5 + 0.5;
+    vec3 c = mix(vec3(0.03, 0.022, 0.017), vec3(0.13, 0.095, 0.07), smoothstep(0.35, 0.95, up));
+    // A soft horizontal band reads as a far wall in reflections.
+    float band = (d.y - 0.1) * 5.0;
+    c += vec3(0.10, 0.06, 0.034) * exp(-band * band);
+    return c;
+}
+
+// ----------------------------------------------------------------------- shadows
+
+// Light passing through a glass ball, treated as a thick lens. This turns each shadow
+// ray into a cheap caustic: bright focus in the middle of the shadow, darker around it,
+// with a slight colour fringe from a per-channel index of refraction.
+vec3 lensTransmission(int index, vec3 p, vec3 wi) {
+    vec3 toCenter = spheres[index].centerRadius.xyz - p;
+    float r = spheres[index].centerRadius.w;
+    float along = dot(toCenter, wi);
+    float impact = length(toCenter - wi * along);
+    vec3 n = spheres[index].absorption.w + vec3(-0.012, 0.0, 0.02);
+    vec3 focal = n * r / (2.0 * (n - 1.0));
+    vec3 m = max(abs(1.0 - along / focal), vec3(0.24));
+    vec3 inside = 1.0 - smoothstep(r * m * 0.7, r * m * 1.15, vec3(impact));
+    vec3 gain = min(1.0 / (m * m), vec3(9.0));
+    float chord = 2.0 * sqrt(max(r * r - impact * impact, 0.0));
+    vec3 absorb = exp(-spheres[index].absorption.xyz * chord);
+    // Glass redirects light rather than blocking it. A black shadow seen through a marble
+    // is what makes it read as opaque, so the area outside the focus stays fairly bright.
+    return max(mix(vec3(0.42), gain * 0.88, inside), vec3(0.42)) * absorb;
+}
+
+vec3 shadowTransmission(vec3 p, vec3 wi, float maxT) {
+    vec3 transmission = vec3(1.0);
+    float start = EPSILON;
+    for (uint i = 0; i < 4; i++) {
+        Hit hit = traceRay(p, wi, start, maxT);
+        if (hit.kind == HIT_NONE) return transmission;
+        if (hit.kind == HIT_TRIANGLE) return vec3(0);
+        transmission *= lensTransmission(hit.primitive, p, wi);
+        // Skip past the back of this ball.
+        vec3 oc = p - spheres[hit.primitive].centerRadius.xyz;
+        float r = spheres[hit.primitive].centerRadius.w;
+        float b = dot(oc, wi);
+        float h = max(b * b - (dot(oc, oc) - r * r), 0.0);
+        start = -b + sqrt(h) + EPSILON;
+        if (start >= maxT) return transmission;
+    }
+    return transmission * 0.3;
+}
+
+vec3 directLight(vec3 p, vec3 n, vec3 v, Surface s) {
+    uint index = rnd() < 0.75 ? 0 : 1;
+    float pick = index == 0 ? 0.75 : 0.25;
+    RectLight l = lightAt(index);
+    vec3 target = l.center + l.u * (rnd() * 2.0 - 1.0) + l.v * (rnd() * 2.0 - 1.0);
+    vec3 toLight = target - p;
+    float dist2 = dot(toLight, toLight);
+    float dist = sqrt(dist2);
+    vec3 wi = toLight / dist;
+    float nl = dot(n, wi);
+    float cosLight = -dot(wi, l.normal);
+    if (nl <= 0.0 || cosLight <= 0.0) return vec3(0);
+    float area = 4.0 * length(l.u) * length(l.v);
+    vec3 visible = shadowTransmission(p + n * EPSILON, wi, dist - EPSILON);
+    if (all(lessThanEqual(visible, vec3(0.0)))) return vec3(0);
+    float geometry = nl * cosLight * area / (dist2 * pick);
+    return l.emission * visible * surfaceBrdf(s, n, v, wi) * geometry;
+}
+
+// Lighting with no randomness, for surfaces seen through glass. Those pixels skip the denoiser
+// to stay crisp, so they must not contain noise: one shadow ray to the centre of each light,
+// and a constant in place of indirect light.
+vec3 cleanLight(vec3 p, vec3 n, vec3 v, Surface s) {
+    vec3 result = s.albedo * vec3(0.20, 0.15, 0.115);
+    for (uint i = 0; i < 2; i++) {
+        RectLight l = lightAt(i);
+        vec3 toLight = l.center - p;
+        float dist2 = dot(toLight, toLight);
+        float dist = sqrt(dist2);
+        vec3 wi = toLight / dist;
+        float nl = dot(n, wi);
+        float cosLight = -dot(wi, l.normal);
+        if (nl <= 0.0 || cosLight <= 0.0) continue;
+        vec3 visible = shadowTransmission(p + n * EPSILON, wi, dist - EPSILON);
+        float area = 4.0 * length(l.u) * length(l.v);
+        result += l.emission * visible * surfaceBrdf(s, n, v, wi) * nl * cosLight * area / dist2;
+    }
+    return result;
+}
+
+// --------------------------------------------------------------------- path tracer
+
+struct FirstHit {
+    bool valid;
+    bool glass;
+    vec3 position;
+    vec3 normal;
+    vec3 motionPosition;  // where this point was in the previous frame
+    vec3 albedo;
+    float distance;
+};
+
+FirstHit first;
+
+vec3 tracePath(vec3 origin, vec3 direction, bool recordFirst, bool primaryReflection) {
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+    bool sharpBounce = true;  // emitters are visible only after mirror/glass bounces
+    uint diffuseHits = 0;
+    float minDistance = 0.0;
+
+    for (uint bounce = 0; bounce < u.maxBounces; bounce++) {
+        Hit hit = traceRay(origin, direction, minDistance, 1e6);
+        // Lights stay out of direct view but show up in glass.
+        if (sharpBounce && bounce > 0) radiance += throughput * hitLights(origin, direction, hit.distance);
+
+        if (hit.kind == HIT_NONE) {
+            // Glass shows the room directly, so it gets a brighter one than the soft bounce light.
+            radiance += throughput * environment(direction) * (sharpBounce && bounce > 0 ? 3.0 : 1.0);
+            return radiance;
+        }
+
+        vec3 p = origin + direction * hit.distance;
+
+        if (hit.kind == HIT_SPHERE) {
+            // ------------------------------------------------------- glass
+            Sphere s = spheres[hit.primitive];
+            vec3 outward = (p - s.centerRadius.xyz) / s.centerRadius.w;
+            bool entering = dot(direction, outward) < 0.0;
+            vec3 n = entering ? outward : -outward;
+            if (!entering) throughput *= exp(-s.absorption.xyz * hit.distance);
+            if (recordFirst && bounce == 0) {
+                first.valid = true;
+                first.glass = true;
+                first.position = p;
+                first.normal = outward;
+                first.motionPosition = p - s.centerRadius.xyz + s.prevCenter.xyz;
+                first.albedo = vec3(1.0);
+                first.distance = hit.distance;
+            }
+            float eta = entering ? 1.0 / s.absorption.w : s.absorption.w;
+            float cosI = saturate(-dot(direction, n));
+            float fresnel = dielectricFresnel(cosI, eta);
+            // No random choice here, since random choices are what make glass look frosted
+            // once filtered. The first hit splits exactly into a reflection path and a
+            // refraction path (see main); later hits follow the dominant direction.
+            bool reflects;
+            if (bounce == 0) {
+                reflects = primaryReflection;
+                throughput *= reflects ? fresnel : 1.0 - fresnel;
+            } else {
+                reflects = fresnel >= 0.5;
+            }
+            // Internal reflection without an extra ray: look up what it would see directly.
+            // This gives the secondary highlight on the far side of real glass balls.
+            if (bounce > 0 && !entering && !reflects) {
+                vec3 inner = reflect(direction, n);
+                radiance += throughput * fresnel * (hitLights(p, inner, 1e6) + environment(inner) * 3.0);
+                throughput *= 1.0 - fresnel;
+            }
+            if (reflects) {
+                direction = normalize(reflect(direction, n));
+                origin = p + n * EPSILON;
+            } else {
+                direction = normalize(refract(direction, n, eta));
+                origin = p - n * EPSILON;
+            }
+            minDistance = EPSILON;
+            sharpBounce = true;
+            continue;
+        }
+
+        // --------------------------------------------------------------- wood and paper
+        int base = hit.primitive * 3;
+        float w = 1.0 - hit.barycentrics.x - hit.barycentrics.y;
+        vec3 n = normalize(vertices[base].normal.xyz * w +
+                           vertices[base + 1].normal.xyz * hit.barycentrics.x +
+                           vertices[base + 2].normal.xyz * hit.barycentrics.y);
+        if (dot(n, direction) > 0.0) n = -n;
+        uint material = uint(vertices[base].position.w);
+        Surface surface;
+        if (material == MATERIAL_PAPER) {
+            surface.roughness = 0.75;
+            surface.albedo = vec3(0.60, 0.575, 0.52);
+            if (diffuseHits == 0) {
+                vec2 offset = p.xz - u.paperOrigin.xy;
+                vec2 uv = vec2(dot(offset, u.paperAxes.xy), dot(offset, u.paperAxes.zw)) * 0.5 + 0.5;
+                // Print is sampled sharper through glass, where a marble magnifies it.
+                float ink = textureLod(paperTexture, vec2(uv.x, 1.0 - uv.y), bounce > 0 ? 0.5 : 1.5).r;
+                surface.albedo = mix(vec3(0.035), vec3(0.76, 0.73, 0.66), ink);
+            }
+        } else {
+            surface = woodSurface(material, p, diffuseHits == 0);
+        }
+        vec3 v = -direction;
+
+        if (recordFirst && bounce == 0) {
+            first.valid = true;
+            first.glass = false;
+            first.position = p;
+            first.normal = n;
+            first.motionPosition = p;
+            first.albedo = surface.albedo;
+            first.distance = hit.distance;
+        }
+
+        if (bounce > 0 && diffuseHits == 0) {
+            radiance += throughput * cleanLight(p, n, v, surface);
+            return radiance;
+        }
+
+        radiance += throughput * directLight(p, n, v, surface);
+
+        diffuseHits += 1;
+        if (diffuseHits > u.diffuseBounces) return radiance;
+
+        float nv = saturate(dot(n, v));
+        float specularChance = max(schlick(nv, 0.04), 0.15);
+        vec3 dir;
+        if (rnd() < specularChance) {
+            dir = sampleGgxReflection(n, v, surface.roughness);
+            if (dot(dir, n) <= 0.0) return radiance;
+            throughput *= schlick(nv, 0.04) / specularChance;
+        } else {
+            dir = sampleCosine(n);
+            throughput *= surface.albedo * (1.0 - schlick(nv, 0.04)) / (1.0 - specularChance);
+        }
+        origin = p + n * EPSILON;
+        direction = dir;
+        minDistance = EPSILON;
+        sharpBounce = false;
+    }
+    // Out of bounces, usually inside glass. A dim ambient guess beats a black pixel.
+    radiance += throughput * vec3(0.09, 0.065, 0.045);
+    return radiance;
+}
+
+vec2 toPixel(mat4 viewProj, vec3 world, vec2 size) {
+    vec4 clip = viewProj * vec4(world, 1.0);
+    vec2 ndc = clip.xy / clip.w;
+    return vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size;
+}
+
+void main() {
+    PIXEL_GUARD
+
+    rngState = (uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + u.frame * 26699u) | 1u;
+    rnd();
+
+    vec2 size = vec2(u.size);
+    vec2 s = (vec2(pixel) + 0.5 - u.jitter) / size * 2.0 - 1.0;
+    float tanFov = u.camUp.w;
+    vec3 dir = normalize(u.camForward.xyz + u.camRight.xyz * (s.x * tanFov * u.camRight.w) - u.camUp.xyz * (s.y * tanFov));
+
+    first.valid = false;
+    first.glass = false;
+    vec3 color = tracePath(u.camPos.xyz, dir, true, false);
+    if (first.glass) {
+        // The first run followed the refraction, this one adds the reflection.
+        color += tracePath(u.camPos.xyz, dir, false, true);
+    }
+    // Keeps rare very bright paths from turning into persistent blobs.
+    float luminance = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    if (luminance > 24.0) color *= 24.0 / luminance;
+    if (any(isnan(color)) || any(isinf(color))) color = vec3(0);
+    imageStore(images[COLOR], pixel, vec4(color, 1.0));
+
+    if (first.valid) {
+        vec2 now = toPixel(u.viewProj, first.position, size);
+        vec2 before = toPixel(u.prevViewProj, first.motionPosition, size);
+        imageStore(images[MOTION], pixel, vec4(before - now, 0, 0));
+        imageStore(images[NORMAL_DEPTH], pixel, vec4(first.normal, first.distance));
+        imageStore(images[ALBEDO], pixel, vec4(first.albedo, first.glass ? 1.0 : 0.0));
+    } else {
+        vec3 far = u.camPos.xyz + dir * 1000.0;
+        vec2 now = toPixel(u.viewProj, far, size);
+        vec2 before = toPixel(u.prevViewProj, far, size);
+        imageStore(images[MOTION], pixel, vec4(before - now, 0, 0));
+        imageStore(images[NORMAL_DEPTH], pixel, vec4(-dir, 0.0));
+        imageStore(images[ALBEDO], pixel, vec4(1.0, 1.0, 1.0, 0.0));
+    }
+}

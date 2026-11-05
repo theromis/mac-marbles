@@ -1,0 +1,18 @@
+#version 460
+// HDR to display: ACES curve and sRGB encoding. The result is copied onto the window afterwards.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+vec3 aces(vec3 x) {
+    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+vec3 srgbEncode(vec3 c) {
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
+}
+
+void main() {
+    PIXEL_GUARD
+    vec3 hdr = imageLoad(images[TAA_NEW], pixel).rgb;
+    imageStore(displayImage, pixel, vec4(srgbEncode(aces(hdr * 0.8)), 1.0));
+}

@@ -1,0 +1,22 @@
+name: Windows build
+
+on:
+  push:
+    paths: ["rust/**", ".github/workflows/rust-windows.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glass-marbles-windows
+          path: rust/target/release/glass-marbles.exe

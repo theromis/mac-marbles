@@ -1,0 +1,42 @@
+#version 460
+// First denoising step: accumulates lighting over time, reprojected with the motion image.
+// Works on irradiance (colour divided by albedo), so wood grain and print are not blurred.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+const float MAX_FRAMES = 32.0;
+
+void main() {
+    PIXEL_GUARD
+
+    vec4 albedo = imageLoad(images[ALBEDO], pixel);
+    // Glass skips the denoiser and starts no history, so a marble leaves no trail on the wood
+    // that it uncovers when it rolls away.
+    if (albedo.a > 0.5) {
+        imageStore(images[HISTORY_NEW], pixel, vec4(0.0));
+        return;
+    }
+
+    vec3 color = imageLoad(images[COLOR], pixel).rgb;
+    vec3 irradiance = color / max(albedo.rgb, vec3(0.01));
+    vec4 normalDepth = imageLoad(images[NORMAL_DEPTH], pixel);
+    vec2 motion = imageLoad(images[MOTION], pixel).xy;
+    ivec2 previous = ivec2(floor(vec2(pixel) + 0.5 + motion));
+
+    float frames = 0.0;
+    vec3 history = vec3(0.0);
+    if (all(greaterThanEqual(previous, ivec2(0))) && all(lessThan(previous, ivec2(u.size)))) {
+        vec4 oldNormalDepth = imageLoad(images[PREV_NORMAL_DEPTH], previous);
+        vec4 old = imageLoad(images[HISTORY_OLD], previous);
+        // The camera moves slowly, so the same surface sits at nearly the same distance.
+        bool sameDepth = abs(oldNormalDepth.w - normalDepth.w) < 0.02 * max(normalDepth.w, 0.1);
+        bool sameFacing = dot(oldNormalDepth.xyz, normalDepth.xyz) > 0.9;
+        if (sameDepth && sameFacing) {
+            frames = old.a;
+            history = old.rgb;
+        }
+    }
+
+    frames = min(frames + 1.0, MAX_FRAMES);
+    imageStore(images[HISTORY_NEW], pixel, vec4(mix(history, irradiance, 1.0 / frames), frames));
+}
